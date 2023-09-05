@@ -1,13 +1,13 @@
 Source: xserver-xorg-video-amdgpu
 Section: x11
 Priority: optional
-Maintainer: Deepin Developer <deepin-dev@deepin.org>
-Uploaders: Deepin Packages Builder <packages@deepin.org>
+Maintainer: Debian X Strike Force <debian-x@lists.debian.org>
+Uploaders: Timo Aaltonen <tjaalton@debian.org>
 Build-Depends:
  debhelper (>= 11),
  quilt,
  libdrm-dev (>= 2.4.89) [!hurd-i386],
- libgl1-mesa-dev | libgl-dev,
+ libgl-dev,
  libgbm-dev,
  libudev-dev [linux-any],
  pkg-config,
@@ -15,8 +15,8 @@ Build-Depends:
  xserver-xorg-dev (>= 2:1.16),
  xutils-dev (>= 1:7.5+4)
 Standards-Version: 4.2.1
-#Vcs-Git
-#Vcs-Browser
+Vcs-Git: https://salsa.debian.org/xorg-team/driver/xserver-xorg-video-amdgpu.git
+Vcs-Browser: https://salsa.debian.org/xorg-team/driver/xserver-xorg-video-amdgpu.git
 
 Package: xserver-xorg-video-amdgpu
 Architecture: linux-any
