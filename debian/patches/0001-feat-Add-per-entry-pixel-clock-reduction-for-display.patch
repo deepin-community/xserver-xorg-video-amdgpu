@@ -1,0 +1,397 @@
+From: zhanghaotian <zhanghaotian@uniontech.com>
+Date: Thu, 18 Jun 2026 13:53:03 +0800
+Subject: feat: Add per-entry pixel clock reduction for display mode
+ compatibility
+
+For certain GPU+resolution combinations, the pixel clock may not match
+hardware requirements exactly, causing black screens or signal issues.
+This change dynamically reduces pixel clock at modeset time for specified
+GPU+clock pairs, replacing Cartesian-product matching with precise per-entry
+targeting (each entry binds GPU PCI ID, pixel clock, and reduction in kHz).
+
+xorg.conf options (example):
+  Option "ClockReduction"       "0x6611:185590:100,0x6611:285540:100"
+  Option "ClockReductionInternal" "off"     (default: on)
+Built-in quirk table defaults: 0x6611 GPU at 185590/229840/235660/285540 kHz
+reduced by 100 kHz. Config entries can extend or override these.
+---
+ src/amdgpu_drv.h      |  25 ++++++
+ src/amdgpu_kms.c      | 183 ++++++++++++++++++++++++++++++++++++++++++
+ src/drmmode_display.c |  86 ++++++++++++++++++++
+ 3 files changed, 294 insertions(+)
+
+diff --git a/src/amdgpu_drv.h b/src/amdgpu_drv.h
+index 2952b7b..48dc05f 100644
+--- a/src/amdgpu_drv.h
++++ b/src/amdgpu_drv.h
+@@ -166,6 +166,8 @@ typedef enum {
+ 	OPTION_DELETE_DP12,
+ 	OPTION_VARIABLE_REFRESH,
+ 	OPTION_ASYNC_FLIP_SECONDARIES,
++	OPTION_CLOCK_REDUCTION,
++	OPTION_CLOCK_REDUCTION_INTERNAL,
+ } AMDGPUOpts;
+ 
+ static inline ScreenPtr
+@@ -247,6 +249,26 @@ struct amdgpu_window_priv {
+ 
+ extern DevScreenPrivateKeyRec amdgpu_device_private_key;
+ 
++/* ClockReduction: per-entry match table.                                    */
++/* Each entry binds a GPU, a pixel clock, and a reduction amount together.   */
++/* xorg.conf options:                                                        */
++/*   Option "ClockReduction" "0x6611:185590:100,0x1234:285540:200"          */
++/*   Option "ClockReductionInternal" "off"           (on/off, default on)    */
++#define CLOCK_REDUCTION_MAX_AMOUNT     1000
++#define CLOCK_REDUCTION_MIN_CLOCK      150000
++
++typedef struct {
++	int gpu_id;
++	int clock_khz;
++	int amount_khz;
++} clock_reduction_entry_t;
++
++typedef struct {
++	clock_reduction_entry_t *entries;
++	int entry_count;
++	Bool use_internal;
++} clock_reduction_config_t;
++
+ typedef struct {
+ 	EntityInfoPtr pEnt;
+ 	uint32_t family;
+@@ -345,6 +367,9 @@ typedef struct {
+ 	} glamor;
+ 
+ 	xf86CrtcFuncsRec drmmode_crtc_funcs;
++
++	/* ClockReduction configuration */
++	clock_reduction_config_t clock_reduction;
+ } AMDGPUInfoRec, *AMDGPUInfoPtr;
+ 
+ 
+diff --git a/src/amdgpu_kms.c b/src/amdgpu_kms.c
+index 1f049c9..b8e76cc 100644
+--- a/src/amdgpu_kms.c
++++ b/src/amdgpu_kms.c
+@@ -88,6 +88,8 @@ const OptionInfoRec AMDGPUOptions_KMS[] = {
+ 	{OPTION_DELETE_DP12, "DeleteUnusedDP12Displays", OPTV_BOOLEAN, {0}, FALSE},
+ 	{OPTION_VARIABLE_REFRESH, "VariableRefresh", OPTV_BOOLEAN, {0}, FALSE },
+ 	{OPTION_ASYNC_FLIP_SECONDARIES, "AsyncFlipSecondaries", OPTV_BOOLEAN, {0}, FALSE},
++	{OPTION_CLOCK_REDUCTION, "ClockReduction", OPTV_STRING, {0}, FALSE},
++	{OPTION_CLOCK_REDUCTION_INTERNAL, "ClockReductionInternal", OPTV_BOOLEAN, {0}, FALSE},
+ 	{-1, NULL, OPTV_NONE, {0}, FALSE}
+ };
+ 
+@@ -1545,6 +1547,176 @@ void AMDGPUWindowExposures_oneshot(WindowPtr pWin, RegionPtr pRegion
+ 	drmmode_set_desired_modes(pScrn, &info->drmmode, TRUE);
+ }
+ 
++static void amdgpu_init_clock_reduction(clock_reduction_config_t *cfg)
++{
++	cfg->entries = NULL;
++	cfg->entry_count = 0;
++	cfg->use_internal = FALSE;
++}
++
++static void amdgpu_free_clock_reduction(clock_reduction_config_t *cfg)
++{
++	free(cfg->entries);
++	cfg->entries = NULL;
++	cfg->entry_count = 0;
++	cfg->use_internal = FALSE;
++}
++
++static Bool parse_number(const char **pp, long *value)
++{
++	const char *p = *pp;
++	char *endptr;
++
++	while (*p == ' ') p++;
++
++	*value = strtol(p, &endptr, 0);
++	if (endptr == p)
++		return FALSE;
++
++	p = endptr;
++	while (*p == ' ') p++;
++	*pp = p;
++	return TRUE;
++}
++
++static int count_and_validate_clock_reduction_entries(ScrnInfoPtr pScrn,
++						      const char *s)
++{
++	const char *p = s;
++	int count = 0;
++	long val;
++
++	while (*p) {
++		if (!parse_number(&p, &val)) {
++			xf86DrvMsgVerb(pScrn->scrnIndex, X_WARNING,
++				       AMDGPU_LOGLEVEL_DEBUG,
++				       "ClockReduction: invalid gpu_id at entry %d\n",
++				       count);
++			return -1;
++		}
++		if (*p != ':') {
++			xf86DrvMsgVerb(pScrn->scrnIndex, X_WARNING,
++				       AMDGPU_LOGLEVEL_DEBUG,
++				       "ClockReduction: expected ':' after gpu_id at entry %d\n",
++				       count);
++			return -1;
++		}
++		p++;
++
++		if (!parse_number(&p, &val)) {
++			xf86DrvMsgVerb(pScrn->scrnIndex, X_WARNING,
++				       AMDGPU_LOGLEVEL_DEBUG,
++				       "ClockReduction: invalid clock at entry %d\n",
++				       count);
++			return -1;
++		}
++		if (*p != ':') {
++			xf86DrvMsgVerb(pScrn->scrnIndex, X_WARNING,
++				       AMDGPU_LOGLEVEL_DEBUG,
++				       "ClockReduction: expected ':' after clock at entry %d\n",
++				       count);
++			return -1;
++		}
++		p++;
++
++		if (!parse_number(&p, &val)) {
++			xf86DrvMsgVerb(pScrn->scrnIndex, X_WARNING,
++				       AMDGPU_LOGLEVEL_DEBUG,
++				       "ClockReduction: invalid amount at entry %d\n",
++				       count);
++			return -1;
++		}
++
++		count++;
++
++		if (*p == ',') {
++			p++;
++			if (!*p) {
++				xf86DrvMsgVerb(pScrn->scrnIndex, X_WARNING,
++					       AMDGPU_LOGLEVEL_DEBUG,
++					       "ClockReduction: trailing comma after entry %d\n",
++					       count);
++				return -1;
++			}
++		} else if (*p != '\0') {
++			xf86DrvMsgVerb(pScrn->scrnIndex, X_WARNING,
++				       AMDGPU_LOGLEVEL_DEBUG,
++				       "ClockReduction: unexpected char '%c' at entry %d\n",
++				       *p, count);
++			return -1;
++		}
++	}
++
++	return count;
++}
++
++static int store_clock_reduction_entries(ScrnInfoPtr pScrn,
++					 clock_reduction_entry_t *entries,
++					 const char *s)
++{
++	const char *p = s;
++	int valid_count = 0;
++	long gpu_id, clock, amount;
++
++	while (*p) {
++		parse_number(&p, &gpu_id);
++		p++;
++		parse_number(&p, &clock);
++		p++;
++		parse_number(&p, &amount);
++
++		if (amount <= 0) {
++			xf86DrvMsgVerb(pScrn->scrnIndex, X_INFO,
++				       AMDGPU_LOGLEVEL_DEBUG,
++				       "ClockReduction: amount 0 at entry %d, skipped\n",
++				       valid_count);
++		} else {
++			if (amount > CLOCK_REDUCTION_MAX_AMOUNT) {
++				amount = CLOCK_REDUCTION_MAX_AMOUNT;
++				xf86DrvMsgVerb(pScrn->scrnIndex, X_INFO,
++					       AMDGPU_LOGLEVEL_DEBUG,
++					       "ClockReduction: amount clamped to %d at entry %d\n",
++					       CLOCK_REDUCTION_MAX_AMOUNT,
++					       valid_count);
++			}
++			entries[valid_count].gpu_id = (int)gpu_id;
++			entries[valid_count].clock_khz = (int)clock;
++			entries[valid_count].amount_khz = (int)amount;
++			valid_count++;
++		}
++
++		if (*p == ',') p++;
++	}
++
++	xf86DrvMsgVerb(pScrn->scrnIndex, X_INFO, AMDGPU_LOGLEVEL_DEBUG,
++		       "ClockReduction: loaded %d entries\n", valid_count);
++	return valid_count;
++}
++
++static void amdgpu_parse_clock_reduction_entries(ScrnInfoPtr pScrn,
++						 clock_reduction_config_t *cfg,
++						 const char *option_value)
++{
++	int n;
++
++	if (!option_value || !*option_value)
++		return;
++
++	n = count_and_validate_clock_reduction_entries(pScrn, option_value);
++	if (n <= 0)
++		return;
++
++	cfg->entries = calloc(n, sizeof(clock_reduction_entry_t));
++	if (!cfg->entries) {
++		xf86DrvMsgVerb(pScrn->scrnIndex, X_ERROR, AMDGPU_LOGLEVEL_DEBUG,
++			       "ClockReduction: Failed to allocate memory\n");
++		return;
++	}
++
++	cfg->entry_count = store_clock_reduction_entries(pScrn, cfg->entries,
++							 option_value);
++}
++
+ Bool AMDGPUPreInit_KMS(ScrnInfoPtr pScrn, int flags)
+ {
+ 	AMDGPUInfoPtr info;
+@@ -1742,6 +1914,14 @@ Bool AMDGPUPreInit_KMS(ScrnInfoPtr pScrn, int flags)
+ 		return FALSE;
+ 	}
+ 
++	amdgpu_init_clock_reduction(&info->clock_reduction);
++	amdgpu_parse_clock_reduction_entries(pScrn,
++			&info->clock_reduction,
++			xf86GetOptValString(info->Options, OPTION_CLOCK_REDUCTION));
++
++	info->clock_reduction.use_internal =
++		xf86ReturnOptValBool(info->Options, OPTION_CLOCK_REDUCTION_INTERNAL, TRUE);
++
+ 	return TRUE;
+ }
+ 
+@@ -1959,9 +2139,12 @@ static Bool AMDGPUCloseScreen_KMS(ScreenPtr pScreen)
+ 
+ void AMDGPUFreeScreen_KMS(ScrnInfoPtr pScrn)
+ {
++	AMDGPUInfoPtr info = AMDGPUPTR(pScrn);
++
+ 	xf86DrvMsgVerb(pScrn->scrnIndex, X_INFO, AMDGPU_LOGLEVEL_DEBUG,
+ 		       "AMDGPUFreeScreen\n");
+ 
++	amdgpu_free_clock_reduction(&info->clock_reduction);
+ 	AMDGPUFreeRec(pScrn);
+ }
+ 
+diff --git a/src/drmmode_display.c b/src/drmmode_display.c
+index 5b73fce..4eef3f0 100644
+--- a/src/drmmode_display.c
++++ b/src/drmmode_display.c
+@@ -1240,6 +1240,85 @@ drmmode_crtc_gamma_do_set(xf86CrtcPtr crtc, uint16_t *red, uint16_t *green,
+ 			   ret);
+ }
+ 
++/*
++ * Internal quirk table for transparent clock reduction.
++ * Each entry binds a GPU, a pixel clock, and a reduction amount together.
++ * Clock reduction happens at modeset time, modifying only kmode.clock
++ * before drmModeSetCrtc.  xrandr still shows the original EDID clock.
++ * Config entries take precedence over internal entries for the same
++ * (gpu_id, clock) pair.
++ */
++static const clock_reduction_entry_t clock_reduction_internal[] = {
++	{0x6611, 185590, 100},
++	{0x6611, 229840, 100},
++	{0x6611, 235660, 100},
++	{0x6611, 285540, 100},
++};
++
++static Bool find_clock_reduction_entry(const clock_reduction_entry_t *entries,
++				       int count, int device_id, int clock,
++				       int *amount)
++{
++	int i;
++	for (i = 0; i < count; i++) {
++		if (entries[i].gpu_id == device_id &&
++		    entries[i].clock_khz == clock) {
++			*amount = entries[i].amount_khz;
++			return TRUE;
++		}
++	}
++	return FALSE;
++}
++
++static void apply_clock_reduction_kmode(ScrnInfoPtr scrn,
++					struct pci_device *dev,
++					AMDGPUInfoPtr info,
++					drmModeModeInfo *kmode,
++					int original_clock)
++{
++	int amount = 0, new_clock;
++	Bool matched = FALSE;
++	int internal_count;
++
++	if (!scrn || !dev || !info || !kmode)
++		return;
++
++	matched = find_clock_reduction_entry(info->clock_reduction.entries,
++					     info->clock_reduction.entry_count,
++					     dev->device_id, original_clock,
++					     &amount);
++
++	if (!matched && info->clock_reduction.use_internal) {
++		internal_count = sizeof(clock_reduction_internal) /
++				 sizeof(clock_reduction_internal[0]);
++		matched = find_clock_reduction_entry(clock_reduction_internal,
++						     internal_count,
++						     dev->device_id,
++						     original_clock, &amount);
++	}
++
++	if (!matched)
++		return;
++
++	if (amount <= 0)
++		return;
++	if (amount > CLOCK_REDUCTION_MAX_AMOUNT)
++		amount = CLOCK_REDUCTION_MAX_AMOUNT;
++
++	new_clock = original_clock - amount;
++	if (new_clock < CLOCK_REDUCTION_MIN_CLOCK) {
++		xf86DrvMsgVerb(scrn->scrnIndex, X_INFO, AMDGPU_LOGLEVEL_DEBUG,
++			"ClockReduction: Skipped clock=%d (would go below %d kHz)\n",
++			original_clock, CLOCK_REDUCTION_MIN_CLOCK);
++		return;
++	}
++
++	kmode->clock = new_clock;
++	xf86DrvMsgVerb(scrn->scrnIndex, X_INFO, AMDGPU_LOGLEVEL_DEBUG,
++		"ClockReduction: Reduced clock %d -> %d kHz (gpu=0x%x, amount=%d)\n",
++		original_clock, new_clock, dev->device_id, amount);
++}
++
+ Bool
+ drmmode_set_mode(xf86CrtcPtr crtc, struct drmmode_fb *fb, DisplayModePtr mode,
+ 		 int x, int y)
+@@ -1270,6 +1349,13 @@ drmmode_set_mode(xf86CrtcPtr crtc, struct drmmode_fb *fb, DisplayModePtr mode,
+ 
+ 	drmmode_ConvertToKMode(scrn, &kmode, mode);
+ 
++	{
++		AMDGPUInfoPtr info = AMDGPUPTR(scrn);
++		struct pci_device *dev = pAMDGPUEnt->platform_dev ?
++			pAMDGPUEnt->platform_dev->pdev : NULL;
++		apply_clock_reduction_kmode(scrn, dev, info, &kmode, mode->Clock);
++	}
++
+ 	ret = drmModeSetCrtc(pAMDGPUEnt->fd,
+ 			     drmmode_crtc->mode_crtc->crtc_id,
+ 			     fb->handle, x, y, output_ids,
+-- 
+2.30.2
+
