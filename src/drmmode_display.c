@@ -2156,6 +2156,63 @@ koutput_get_prop_blob(int fd, drmModeConnectorPtr koutput, const char *name)
     return blob;
 }
 
+/* Bug #372379: Oland(0x6611) HDMI 1920x1080@120Hz black screen.
+ * VBIOS picks ref_div=25 for 285540kHz, phase detector drops to
+ * 1.08MHz and PLL jitter exceeds TMDS tolerance (SCDC 0x40=0x00).
+ * Replace the 285540kHz mode with a 285000kHz variant so the PLL
+ * lands on ref_div=15/post_div=3 (PD=1.80MHz) and adjust htotal
+ * to keep the refresh rate at 120Hz. */
+static DisplayModePtr
+amdgpu_quirk_oland_120hz(struct pci_device *dev, DisplayModePtr Modes,
+			 xf86OutputPtr output)
+{
+	DisplayModePtr Mode;
+	Bool found = FALSE;
+
+	if (!dev || dev->device_id != 0x6611 ||
+	    strncmp(output->name, "HDMI", 4))
+		return Modes;
+
+	for (Mode = Modes; Mode; Mode = Mode->next) {
+		if (Mode->HDisplay == 1920 && Mode->VDisplay == 1080 &&
+		    Mode->Clock == 285540) {
+			Mode->status = MODE_BAD;
+			xf86Msg(X_INFO,
+				"amdgpu: disable 1920x1080@120Hz clock=%d (Oland PLL jitter workaround)\n",
+				Mode->Clock);
+			found = TRUE;
+		}
+	}
+	if (!found)
+		return Modes;
+
+	/* add custom 1920x1080@120Hz low-clock mode */
+	Mode = xnfcalloc(sizeof(DisplayModeRec), 1);
+	Mode->status = MODE_OK;
+	Mode->type = M_T_DRIVER;
+	Mode->Clock = 285000;
+	Mode->HDisplay = 1920;
+	Mode->HSyncStart = 1968;
+	Mode->HSyncEnd = 2000;
+	Mode->HTotal = 2076;
+	Mode->VDisplay = 1080;
+	Mode->VSyncStart = 1083;
+	Mode->VSyncEnd = 1088;
+	Mode->VTotal = 1144;
+	Mode->Flags = V_PHSYNC | V_NVSYNC;
+	Mode->HSkew = 0;
+	Mode->VScan = 0;
+	Mode->name = strdup("1920x1080");
+	/* xf86SetModeCrtc() only fills in the derived CRTC timings and
+	 * VRefresh rate for this mode structure; it does not touch the
+	 * screen or set any resolution. */
+	xf86SetModeCrtc(Mode, output->scrn->adjustFlags);
+	xf86Msg(X_INFO,
+		"amdgpu: add custom 1920x1080@120Hz low-clock mode clock=%d htotal=%d (Oland PLL jitter workaround)\n",
+		Mode->Clock, Mode->HTotal);
+	return xf86ModesAdd(Modes, Mode);
+}
+
 static DisplayModePtr drmmode_output_get_modes(xf86OutputPtr output)
 {
 	drmmode_output_private_ptr drmmode_output = output->driver_private;
@@ -2164,9 +2221,13 @@ static DisplayModePtr drmmode_output_get_modes(xf86OutputPtr output)
 	int i;
 	DisplayModePtr Modes = NULL, Mode;
 	xf86MonPtr mon = NULL;
+	struct pci_device *dev = NULL;
 
 	if (!koutput)
 		return NULL;
+
+	if (pAMDGPUEnt->platform_dev && pAMDGPUEnt->platform_dev->pdev)
+		dev = pAMDGPUEnt->platform_dev->pdev;
 
 	drmModeFreePropertyBlob(drmmode_output->edid_blob);
 
@@ -2193,7 +2254,7 @@ static DisplayModePtr drmmode_output_get_modes(xf86OutputPtr output)
 		Modes = xf86ModesAdd(Modes, Mode);
 
 	}
-	return Modes;
+	return amdgpu_quirk_oland_120hz(dev, Modes, output);
 }
 
 static void drmmode_output_destroy(xf86OutputPtr output)
