@@ -1,3 +1,11 @@
+xserver-xorg-video-amdgpu (23.0.0-1deepin2) unstable; urgency=medium
+
+  * Fix Oland(0x6611) HDMI 1920x1080@120Hz black screen: replace 285540kHz
+    mode with 285000kHz low-clock variant to avoid VBIOS picking
+    ref_div=25 (PD=1.08MHz) which causes PLL jitter beyond TMDS tolerance.
+
+ -- jiangxiangqian <jiangxiangqian@uniontech.com>  Thu, 27 Aug 2026 14:00:00 +0800
+
 xserver-xorg-video-amdgpu (23.0.0-1deepin1) unstable; urgency=medium
 
   * feat: Add ClockReduction feature for modeset-time pixel clock adjustment
