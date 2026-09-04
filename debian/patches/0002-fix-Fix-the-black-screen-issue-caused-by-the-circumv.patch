@@ -1,0 +1,139 @@
+From 33c96d76be6fd6a269fbedd484ffe5b412f9f995 Mon Sep 17 00:00:00 2001
+From: zhanghaotian <zhanghaotian@uniontech.com>
+Date: Fri, 4 Sep 2026 17:35:10 +0800
+Subject: [PATCH] fix: Fix the black screen issue caused by the circumvention
+ scheme on specific monitors
+
+Add a blacklist of monitors to fix the black screen issue caused by
+the circumvention scheme on specific monitors
+---
+ src/drmmode_display.c | 92 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 90 insertions(+), 2 deletions(-)
+
+diff --git a/src/drmmode_display.c b/src/drmmode_display.c
+index 4eef3f0..d629a45 100644
+--- a/src/drmmode_display.c
++++ b/src/drmmode_display.c
+@@ -1255,6 +1255,80 @@ static const clock_reduction_entry_t clock_reduction_internal[] = {
+ 	{0x6611, 285540, 100},
+ };
+ 
++/*
++ * Hardcoded monitor blacklist: monitors whose EDID matches one of these
++ * entries are excluded from the ClockReduction workaround.  Driving them
++ * with the reduced pixel clock can leave them dark, so for these monitors
++ * the original (unmodified) pixel clock must be kept.
++ *
++ * Fields are read from the monitor EDID:
++ *   vendor  - 3-letter PNP manufacturer code, e.g. "AOC"
++ *   prod_id - EDID product code (16-bit), 0 = match any product
++ *   serial  - EDID serial number, 0 = match any serial
++ * Use the whole-model identity (vendor + prod_id) unless a single unit must
++ * be pinned down, in which case add the serial too.
++ */
++typedef struct {
++	char vendor[4];
++	unsigned long prod_id;
++	unsigned long serial;
++} clock_reduction_blacklist_entry_t;
++
++static const clock_reduction_blacklist_entry_t
++clock_reduction_blacklist_internal[] = {
++	{ "RTM", 0x0238, 0 },
++};
++
++static Bool
++clock_reduction_monitor_blacklisted(xf86MonPtr mon)
++{
++	int i;
++	int count = sizeof(clock_reduction_blacklist_internal) /
++		    sizeof(clock_reduction_blacklist_internal[0]);
++
++	if (!mon)
++		return FALSE;
++
++	for (i = 0; i < count; i++) {
++		const clock_reduction_blacklist_entry_t *e =
++			&clock_reduction_blacklist_internal[i];
++
++		if (!e->vendor[0])
++			continue;
++		if (strncmp(e->vendor, mon->vendor.name, 3) != 0)
++			continue;
++		if (e->prod_id != 0 &&
++		    e->prod_id != (unsigned long) mon->vendor.prod_id)
++			continue;
++		if (e->serial != 0 &&
++		    e->serial != mon->vendor.serial)
++			continue;
++		return TRUE;
++	}
++
++	return FALSE;
++}
++
++static xf86MonPtr
++clock_reduction_crtc_blacklisted_monitor(xf86CrtcPtr crtc)
++{
++	ScrnInfoPtr scrn = crtc->scrn;
++	xf86CrtcConfigPtr xf86_config = XF86_CRTC_CONFIG_PTR(scrn);
++	int i;
++
++	for (i = 0; i < xf86_config->num_output; i++) {
++		xf86OutputPtr output = xf86_config->output[i];
++
++		if (output->crtc != crtc || !output->MonInfo)
++			continue;
++
++		if (clock_reduction_monitor_blacklisted(output->MonInfo))
++			return output->MonInfo;
++	}
++
++	return NULL;
++}
++
+ static Bool find_clock_reduction_entry(const clock_reduction_entry_t *entries,
+ 				       int count, int device_id, int clock,
+ 				       int *amount)
+@@ -1274,7 +1348,8 @@ static void apply_clock_reduction_kmode(ScrnInfoPtr scrn,
+ 					struct pci_device *dev,
+ 					AMDGPUInfoPtr info,
+ 					drmModeModeInfo *kmode,
+-					int original_clock)
++					int original_clock,
++					xf86MonPtr blacklisted_monitor)
+ {
+ 	int amount = 0, new_clock;
+ 	Bool matched = FALSE;
+@@ -1283,6 +1358,15 @@ static void apply_clock_reduction_kmode(ScrnInfoPtr scrn,
+ 	if (!scrn || !dev || !info || !kmode)
+ 		return;
+ 
++	if (blacklisted_monitor) {
++		xf86DrvMsgVerb(scrn->scrnIndex, X_INFO, AMDGPU_LOGLEVEL_DEBUG,
++			"ClockReduction: Skipped clock=%d (blacklisted monitor %.3s, prod 0x%x, serial 0x%x)\n",
++			original_clock, blacklisted_monitor->vendor.name,
++			blacklisted_monitor->vendor.prod_id,
++			blacklisted_monitor->vendor.serial);
++		return;
++	}
++
+ 	matched = find_clock_reduction_entry(info->clock_reduction.entries,
+ 					     info->clock_reduction.entry_count,
+ 					     dev->device_id, original_clock,
+@@ -1353,7 +1437,11 @@ drmmode_set_mode(xf86CrtcPtr crtc, struct drmmode_fb *fb, DisplayModePtr mode,
+ 		AMDGPUInfoPtr info = AMDGPUPTR(scrn);
+ 		struct pci_device *dev = pAMDGPUEnt->platform_dev ?
+ 			pAMDGPUEnt->platform_dev->pdev : NULL;
+-		apply_clock_reduction_kmode(scrn, dev, info, &kmode, mode->Clock);
++		xf86MonPtr blacklisted_monitor =
++			clock_reduction_crtc_blacklisted_monitor(crtc);
++
++		apply_clock_reduction_kmode(scrn, dev, info, &kmode,
++					    mode->Clock, blacklisted_monitor);
+ 	}
+ 
+ 	ret = drmModeSetCrtc(pAMDGPUEnt->fd,
+-- 
+2.30.2
+
