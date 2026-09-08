@@ -1,0 +1,218 @@
+From: zhanghaotian <zhanghaotian@uniontech.com>
+Date: Mon, 7 Sep 2026 15:33:00 +0800
+Subject: feat: Reduce pixel clock for specific displays to fix black
+ screen
+
+Certain display mode combinations cause a black screen because the pixel
+clock is not accepted by the hardware.  Apply a small clock reduction at
+modeset time only for the targeted displays, identified by their EDID
+vendor and product id, so other monitors are unaffected.
+
+The quirk table is built-in and can be disabled via xorg.conf Option
+"ClockReduction" (default on).
+---
+ src/amdgpu_drv.h      |   5 ++
+ src/amdgpu_kms.c      |   5 ++
+ src/drmmode_display.c | 112 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 122 insertions(+)
+
+diff --git a/src/amdgpu_drv.h b/src/amdgpu_drv.h
+index 2952b7b..1ac88bc 100644
+--- a/src/amdgpu_drv.h
++++ b/src/amdgpu_drv.h
+@@ -166,6 +166,7 @@ typedef enum {
+ 	OPTION_DELETE_DP12,
+ 	OPTION_VARIABLE_REFRESH,
+ 	OPTION_ASYNC_FLIP_SECONDARIES,
++	OPTION_CLOCK_REDUCTION,
+ } AMDGPUOpts;
+ 
+ static inline ScreenPtr
+@@ -250,6 +251,7 @@ extern DevScreenPrivateKeyRec amdgpu_device_private_key;
+ typedef struct {
+ 	EntityInfoPtr pEnt;
+ 	uint32_t family;
++	uint32_t device_id;
+ 	struct gbm_device *gbm;
+ 
+ 	Bool(*CloseScreen) (ScreenPtr pScreen);
+@@ -345,6 +347,9 @@ typedef struct {
+ 	} glamor;
+ 
+ 	xf86CrtcFuncsRec drmmode_crtc_funcs;
++
++	/* ClockReduction master switch (Option "ClockReduction") */
++	Bool clock_reduction_enabled;
+ } AMDGPUInfoRec, *AMDGPUInfoPtr;
+ 
+ 
+diff --git a/src/amdgpu_kms.c b/src/amdgpu_kms.c
+index 1f049c9..f826d41 100644
+--- a/src/amdgpu_kms.c
++++ b/src/amdgpu_kms.c
+@@ -88,6 +88,7 @@ const OptionInfoRec AMDGPUOptions_KMS[] = {
+ 	{OPTION_DELETE_DP12, "DeleteUnusedDP12Displays", OPTV_BOOLEAN, {0}, FALSE},
+ 	{OPTION_VARIABLE_REFRESH, "VariableRefresh", OPTV_BOOLEAN, {0}, FALSE },
+ 	{OPTION_ASYNC_FLIP_SECONDARIES, "AsyncFlipSecondaries", OPTV_BOOLEAN, {0}, FALSE},
++	{OPTION_CLOCK_REDUCTION, "ClockReduction", OPTV_BOOLEAN, {0}, FALSE},
+ 	{-1, NULL, OPTV_NONE, {0}, FALSE}
+ };
+ 
+@@ -1430,6 +1431,7 @@ static Bool AMDGPUPreInitChipType_KMS(ScrnInfoPtr pScrn,
+ 		   pScrn->chipset, gpu_info->asic_id);
+ 
+ 	info->family = gpu_info->family_id;
++	info->device_id = gpu_info->asic_id;
+ 
+ 	return TRUE;
+ }
+@@ -1742,6 +1744,9 @@ Bool AMDGPUPreInit_KMS(ScrnInfoPtr pScrn, int flags)
+ 		return FALSE;
+ 	}
+ 
++	info->clock_reduction_enabled =
++		xf86ReturnOptValBool(info->Options, OPTION_CLOCK_REDUCTION, TRUE);
++
+ 	return TRUE;
+ }
+ 
+diff --git a/src/drmmode_display.c b/src/drmmode_display.c
+index 5b73fce..b93c01f 100644
+--- a/src/drmmode_display.c
++++ b/src/drmmode_display.c
+@@ -30,6 +30,7 @@
+ #endif
+ 
+ #include <errno.h>
++#include <strings.h>
+ #include <sys/ioctl.h>
+ #include <time.h>
+ #include "cursorstr.h"
+@@ -1240,6 +1241,114 @@ drmmode_crtc_gamma_do_set(xf86CrtcPtr crtc, uint16_t *red, uint16_t *green,
+ 			   ret);
+ }
+ 
++/*
++ * Built-in quirk table for transparent clock reduction.
++ *
++ * For certain GPU + monitor + pixel-clock combinations the hardware does
++ * not accept the EDID clock exactly and the display goes black.  The quirk
++ * below reduces kmode.clock by a small amount at modeset time only when a
++ * targeted monitor (identified by EDID vendor + product id) runs at one of
++ * the listed clocks.  Every other display is left untouched.  xrandr still
++ * reports the original EDID clock.
++ *
++ * Controlled by xorg.conf Option "ClockReduction" (default on).
++ */
++
++typedef struct {
++	int gpu_id;
++	const char *vendor;
++	int prod_id;
++	int clock_khz;
++	int amount_khz;
++} clock_reduction_entry_t;
++
++static const clock_reduction_entry_t clock_reduction_quirks[] = {
++	/* gpu_id,  vendor,  prod_id,  clock_khz,  amount_khz */
++	{ 0x6611, "XMI", 0x23c3, 185590, 100 },
++};
++
++static Bool clock_reduction_lookup(const clock_reduction_entry_t *table,
++				   int table_size, int device_id,
++				   const char *vendor, int prod_id,
++				   int clock, int *amount)
++{
++	int i;
++
++	for (i = 0; i < table_size; i++) {
++		if (table[i].gpu_id == device_id &&
++		    table[i].prod_id == prod_id &&
++		    table[i].clock_khz == clock &&
++		    strcasecmp(table[i].vendor, vendor) == 0) {
++			*amount = table[i].amount_khz;
++			return TRUE;
++		}
++	}
++	return FALSE;
++}
++
++static void apply_clock_reduction_kmode(ScrnInfoPtr scrn,
++					AMDGPUInfoPtr info,
++					xf86CrtcPtr crtc,
++					drmModeModeInfo *kmode,
++					int original_clock)
++{
++	xf86CrtcConfigPtr xf86_config = XF86_CRTC_CONFIG_PTR(scrn);
++	int amount = 0, new_clock;
++	const char *vendor = NULL;
++	int prod_id = 0;
++	int i;
++
++	if (!scrn || !info || !kmode || !crtc)
++		return;
++	if (!info->clock_reduction_enabled)
++		return;
++
++	/* The reduced clock is shared by every output driven by this CRTC,
++	 * so only reduce when every EDID-bearing output bound to the CRTC
++	 * is the same targeted monitor.  A CRTC driving two different
++	 * monitors (clone) is left untouched so the quirk can never hurt a
++	 * display that does not need it.
++	 */
++	for (i = 0; i < xf86_config->num_output; i++) {
++		xf86OutputPtr output = xf86_config->output[i];
++		xf86MonPtr mon;
++
++		if (output->crtc != crtc)
++			continue;
++
++		mon = output->MonInfo;
++		if (!mon)
++			return;
++
++		if (!vendor) {
++			vendor = mon->vendor.name;
++			prod_id = mon->vendor.prod_id;
++		} else if (strcasecmp(vendor, mon->vendor.name) != 0 ||
++			   prod_id != mon->vendor.prod_id) {
++			/* Distinct monitors share this CRTC: do nothing. */
++			return;
++		}
++	}
++
++	if (!vendor)
++		return;
++
++	if (!clock_reduction_lookup(clock_reduction_quirks,
++				    sizeof(clock_reduction_quirks) /
++				    sizeof(clock_reduction_quirks[0]),
++				    info->device_id, vendor, prod_id,
++				    original_clock, &amount))
++		return;
++
++	new_clock = original_clock - amount;
++
++	kmode->clock = new_clock;
++	xf86DrvMsgVerb(scrn->scrnIndex, X_INFO, AMDGPU_LOGLEVEL_DEBUG,
++		"ClockReduction: Reduced clock %d -> %d kHz (gpu=0x%x, vendor=%s, prod=0x%x, amount=%d)\n",
++		original_clock, new_clock, info->device_id, vendor, prod_id,
++		amount);
++}
++
+ Bool
+ drmmode_set_mode(xf86CrtcPtr crtc, struct drmmode_fb *fb, DisplayModePtr mode,
+ 		 int x, int y)
+@@ -1270,6 +1379,9 @@ drmmode_set_mode(xf86CrtcPtr crtc, struct drmmode_fb *fb, DisplayModePtr mode,
+ 
+ 	drmmode_ConvertToKMode(scrn, &kmode, mode);
+ 
++	apply_clock_reduction_kmode(scrn, AMDGPUPTR(scrn), crtc, &kmode,
++				    mode->Clock);
++
+ 	ret = drmModeSetCrtc(pAMDGPUEnt->fd,
+ 			     drmmode_crtc->mode_crtc->crtc_id,
+ 			     fb->handle, x, y, output_ids,
+-- 
+2.30.2
+
